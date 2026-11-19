@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import http.server
 import os
+import select
 import shutil
 import signal
 import socket
@@ -13,13 +14,16 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import webbrowser
 from pathlib import Path
 
 HOST = "127.0.0.1"
 TTYD_PORT = 7681
+TTYD_PATH = "/ttyd"
 START_TIMEOUT = 5.0
 TTYD_LOG = Path("/tmp/ttyd.log")
+TTYD_CLIENT_HTML = ""
 
 PAGE_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -157,7 +161,7 @@ iframe {
 (() => {
     "use strict";
 
-    const START_URL = "__TTYD_URL__";
+    const START_URL = "/ttyd/";
     const tabsEl = document.getElementById("tabs");
     const panesEl = document.getElementById("panes");
     const addBtn = document.getElementById("newTab");
@@ -216,6 +220,26 @@ iframe {
         const frame = pane && pane.querySelector("iframe");
         if (frame) frame.focus();
         tab.scrollIntoView({ block: "nearest", inline: "nearest" });
+    }
+
+    function moveTab(step) {
+        const items = tabs();
+        if (items.length < 2) return null;
+        const current = items.indexOf(tabsEl.querySelector(".tab.active"));
+        if (current === -1) return null;
+        const next = items[(current + step + items.length) % items.length];
+        activate(next);
+        return next;
+    }
+
+    // 终端页面通过 /ttyd/ 反向代理到 ttyd，与包装页同源，因此可以直接监听 iframe 内的按键。
+    function handleFrameKey(event) {
+        if (!event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        if (tabs().length < 2) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        moveTab(event.key === "ArrowRight" ? 1 : -1);
     }
 
     function closeTab(tab) {
@@ -312,7 +336,7 @@ iframe {
         const label = document.createElement("span");
         label.className = "label";
         label.textContent = name;
-        label.title = "双击重命名，拖动调整顺序";
+        label.title = "双击重命名，拖动调整顺序，Shift+左右方向键切换标签";
         const close = document.createElement("button");
         close.className = "close";
         close.type = "button";
@@ -330,6 +354,14 @@ iframe {
         const frame = document.createElement("iframe");
         frame.src = START_URL;
         frame.title = name;
+        frame.addEventListener("load", () => {
+            try {
+                const view = frame.contentWindow;
+                if (view) view.addEventListener("keydown", handleFrameKey, true);
+            } catch (error) {
+                // 终端页面跨源时无法监听，忽略
+            }
+        });
         pane.appendChild(frame);
 
         tab.addEventListener("click", (event) => {
@@ -406,14 +438,10 @@ iframe {
 
     tabsEl.addEventListener("keydown", (event) => {
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-        const items = tabs();
-        if (items.length < 2) return;
-        const current = items.indexOf(document.activeElement.closest(".tab"));
-        if (current === -1) return;
-        event.preventDefault();
         const step = event.key === "ArrowRight" ? 1 : -1;
-        const next = items[(current + step + items.length) % items.length];
-        activate(next);
+        const next = moveTab(step);
+        if (!next) return;
+        event.preventDefault();
         next.focus();
     });
 
@@ -422,7 +450,7 @@ iframe {
 </script>
 </body>
 </html>
-""".replace("__TTYD_URL__", f"http://{HOST}:{TTYD_PORT}")
+"""
 
 
 def port_open(port: int, timeout: float = 0.25) -> bool:
@@ -478,23 +506,90 @@ def stop_process(process: subprocess.Popen | None) -> None:
             os.killpg(process.pid, signal.SIGKILL)
 
 
+def load_ttyd_client() -> str:
+    try:
+        with urllib.request.urlopen(f"http://{HOST}:{TTYD_PORT}/", timeout=START_TIMEOUT) as response:
+            return response.read().decode("utf-8")
+    except OSError as error:
+        sys.exit(f"无法读取 ttyd 页面，请检查 {TTYD_LOG}：{error}")
+
+
 class PageHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        if self.path not in ("/", "/hterminal.html"):
+        path, _, query = self.path.partition("?")
+        if path in ("/", "/hterminal.html"):
+            self.send_html(PAGE_HTML)
+        elif path == TTYD_PATH or path.startswith(f"{TTYD_PATH}/"):
+            self.serve_ttyd(path, query)
+        else:
             self.send_error(404)
-            return
-        body = PAGE_HTML.encode("utf-8")
+
+    def serve_ttyd(self, path: str, query: str) -> None:
+        if self.headers.get("Upgrade", "").lower() == "websocket":
+            target = path[len(TTYD_PATH):] or "/"
+            self.tunnel(f"{target}?{query}" if query else target)
+        elif path == f"{TTYD_PATH}/token":
+            self.relay_token()
+        else:
+            # 由本服务提供 ttyd 页面，使 iframe 与包装页同源，才能监听终端内的按键
+            self.send_html(TTYD_CLIENT_HTML)
+
+    def send_html(self, html: str) -> None:
+        body = html.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def relay_token(self) -> None:
+        try:
+            with urllib.request.urlopen(f"http://{HOST}:{TTYD_PORT}/token", timeout=START_TIMEOUT) as response:
+                body = response.read()
+                content_type = response.headers.get("Content-Type", "application/json;charset=utf-8")
+        except OSError:
+            body = b'{"token": ""}'
+            content_type = "application/json;charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def tunnel(self, target: str) -> None:
+        self.close_connection = True
+        try:
+            upstream = socket.create_connection((HOST, TTYD_PORT))
+        except OSError:
+            self.send_error(502)
+            return
+        try:
+            lines = [f"GET {target} HTTP/1.1"]
+            for key, value in self.headers.items():
+                if key.lower() == "host":
+                    value = f"{HOST}:{TTYD_PORT}"
+                lines.append(f"{key}: {value}")
+            upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1"))
+            peers = {self.connection: upstream, upstream: self.connection}
+            while True:
+                readable, _, _ = select.select(list(peers), [], [], 30)
+                for source in readable:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    peers[source].sendall(data)
+        except OSError:
+            pass
+        finally:
+            upstream.close()
+
     def log_message(self, format: str, *args: object) -> None:
         pass
 
 
 def start_page_server() -> tuple[http.server.ThreadingHTTPServer, str]:
+    global TTYD_CLIENT_HTML
+    TTYD_CLIENT_HTML = load_ttyd_client()
     server = http.server.ThreadingHTTPServer((HOST, 0), PageHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, f"http://{HOST}:{server.server_address[1]}/"
