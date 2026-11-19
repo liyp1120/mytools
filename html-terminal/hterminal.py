@@ -104,6 +104,17 @@ body {
     cursor: pointer;
 }
 .tab .close:hover { background: #3a3a3a; color: var(--text); }
+.tab .rename {
+    min-width: 4em;
+    max-width: 14em;
+    padding: 1px 4px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: #1e1e1e;
+    color: var(--text);
+    font: inherit;
+    outline: none;
+}
 .tabs.single .tab .close { visibility: hidden; }
 .add {
     flex: 0 0 40px;
@@ -191,6 +202,68 @@ iframe {
         }
     }
 
+    function applyName(tab, name) {
+        tab.dataset.name = name;
+        const label = tab.querySelector(".label");
+        if (label) label.textContent = name;
+        const close = tab.querySelector(".close");
+        if (close) {
+            close.title = `关闭${name}`;
+            close.setAttribute("aria-label", `关闭${name}`);
+        }
+        const pane = document.getElementById(tab.getAttribute("aria-controls"));
+        const frame = pane && pane.querySelector("iframe");
+        if (frame) frame.title = name;
+    }
+
+    function startRename(tab) {
+        if (tab.querySelector(".rename")) return;
+        const label = tab.querySelector(".label");
+        if (!label) return;
+
+        const input = document.createElement("input");
+        input.className = "rename";
+        input.type = "text";
+        input.value = tab.dataset.name || label.textContent;
+        input.spellcheck = false;
+        input.setAttribute("aria-label", "终端名称");
+        const fitSize = () => {
+            input.size = Math.max(4, Math.min(18, input.value.length * 2 || 4));
+        };
+        fitSize();
+        let done = false;
+
+        function finish(commit, refocus) {
+            if (done) return;
+            done = true;
+            const next = commit ? input.value.trim() : "";
+            input.remove();
+            label.hidden = false;
+            if (next) applyName(tab, next);
+            if (refocus) tab.focus();
+        }
+
+        input.addEventListener("keydown", (event) => {
+            event.stopPropagation();
+            if (event.key === "Enter") {
+                event.preventDefault();
+                finish(true, true);
+            } else if (event.key === "Escape") {
+                event.preventDefault();
+                finish(false, true);
+            }
+        });
+        input.addEventListener("click", (event) => event.stopPropagation());
+        input.addEventListener("dblclick", (event) => event.stopPropagation());
+        input.addEventListener("input", fitSize);
+        input.addEventListener("blur", () => finish(true, false));
+
+        label.hidden = true;
+        label.after(input);
+        input.focus();
+        input.select();
+    }
+
     function createTab() {
         counter += 1;
         const name = `终端 ${counter}`;
@@ -199,13 +272,16 @@ iframe {
         const tab = document.createElement("div");
         tab.className = "tab";
         tab.id = `${id}-tab`;
+        tab.dataset.name = name;
         tab.setAttribute("role", "tab");
         tab.setAttribute("aria-selected", "false");
         tab.setAttribute("aria-controls", `${id}-panel`);
         tab.tabIndex = -1;
 
         const label = document.createElement("span");
+        label.className = "label";
         label.textContent = name;
+        label.title = "双击重命名";
         const close = document.createElement("button");
         close.className = "close";
         close.type = "button";
@@ -238,6 +314,10 @@ iframe {
                 event.preventDefault();
                 closeTab(tab);
             }
+        });
+        tab.addEventListener("dblclick", (event) => {
+            if (event.target.closest(".close")) return;
+            startRename(tab);
         });
         tab.addEventListener("keydown", (event) => {
             if (event.key === "Enter" || event.key === " ") {
