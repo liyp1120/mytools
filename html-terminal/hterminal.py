@@ -58,6 +58,7 @@ body {
     color: var(--text);
 }
 .tabbar {
+    position: relative;
     display: flex;
     flex: 0 0 36px;
     align-items: stretch;
@@ -72,6 +73,44 @@ body {
     scrollbar-width: none;
 }
 .tabs::-webkit-scrollbar { display: none; }
+/* 标签栏右侧空白处轮流显示小技巧，绝对定位在空白区内，不占用标签宽度 */
+.tips {
+    position: absolute;
+    top: 0;
+    right: 52px;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    pointer-events: none;
+    color: var(--muted);
+    font-size: 12px;
+    white-space: nowrap;
+}
+.tips[hidden] { display: none; }
+.tips .tip {
+    position: relative;
+    padding-left: 12px;
+}
+.tips .tip::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 3px;
+    height: 3px;
+    margin-top: -1.5px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: .55;
+}
+@keyframes tip-in {
+    from { opacity: 0; transform: translateY(7px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.tips .tip.tip-in { animation: tip-in .38s ease; }
+@media (prefers-reduced-motion: reduce) {
+    .tips .tip.tip-in { animation: none; }
+}
 .tab {
     display: inline-flex;
     align-items: center;
@@ -154,6 +193,7 @@ iframe {
 <body>
 <div class="tabbar">
     <div class="tabs" id="tabs" role="tablist" aria-label="终端标签"></div>
+    <div class="tips" id="tips" aria-hidden="true" hidden><span class="tip" id="tipText"></span></div>
     <button class="add" id="newTab" type="button" title="新建终端" aria-label="新建终端">+</button>
 </div>
 <div class="panes" id="panes"></div>
@@ -165,6 +205,17 @@ iframe {
     const tabsEl = document.getElementById("tabs");
     const panesEl = document.getElementById("panes");
     const addBtn = document.getElementById("newTab");
+    const tipsEl = document.getElementById("tips");
+    const tipText = document.getElementById("tipText");
+    const TIP_TEXT = [
+        "Shift + 方向键切换标签页",
+        "双击标签页重命名",
+        "拖动标签页调整位置"
+    ];
+    const TIP_INTERVAL = 6000; // 每条提示显示的时长
+    const TIP_GAP = 12;        // 提示与标签、+ 按钮之间的留白
+    let tipsRaf = 0;
+    let tipIndex = -1;
     let counter = 0;
     let dragTab = null;
     let scrollDir = 0;
@@ -201,8 +252,49 @@ iframe {
         }
     }
 
+    // 标签栏右侧空白区轮流显示一条小技巧；空白不足时隐藏，避免压到标签。
+    function showTip() {
+        tipIndex = (tipIndex + 1) % TIP_TEXT.length;
+        tipText.textContent = TIP_TEXT[tipIndex];
+        tipText.classList.remove("tip-in");
+        void tipText.offsetWidth; // 强制回流，让入场动画重新播放
+        tipText.classList.add("tip-in");
+    }
+
+    function measureTip(text) {
+        const probe = document.createElement("span");
+        probe.style.position = "absolute";
+        probe.style.visibility = "hidden";
+        probe.textContent = text;
+        tipsEl.appendChild(probe);
+        const width = probe.offsetWidth;
+        probe.remove();
+        return width;
+    }
+
+    function renderTips() {
+        tipsRaf = 0;
+        const used = tabs().reduce((sum, tab) => sum + tab.offsetWidth, 0);
+        const blank = tabsEl.clientWidth - used;
+
+        // 临时显示以取得真实宽度（隐藏元素无法测量），同一帧内恢复，不会闪烁。
+        tipsEl.hidden = false;
+        tipsEl.style.visibility = "hidden";
+        const widest = TIP_TEXT.reduce((max, text) => Math.max(max, measureTip(text)), 0);
+        tipsEl.style.visibility = "";
+
+        // 圆点占 12px，提示两侧再各留 TIP_GAP 的空白。
+        tipsEl.hidden = blank < widest + 12 + TIP_GAP * 2;
+    }
+
+    function scheduleTips() {
+        if (tipsRaf) return;
+        tipsRaf = requestAnimationFrame(renderTips);
+    }
+
     function sync() {
         tabsEl.classList.toggle("single", tabs().length <= 1);
+        scheduleTips();
     }
 
     function activate(tab) {
@@ -310,7 +402,10 @@ iframe {
         });
         input.addEventListener("click", (event) => event.stopPropagation());
         input.addEventListener("dblclick", (event) => event.stopPropagation());
-        input.addEventListener("input", fitSize);
+        input.addEventListener("input", () => {
+            fitSize();
+            scheduleTips();
+        });
         input.addEventListener("blur", () => finish(true, false));
 
         label.hidden = true;
@@ -444,6 +539,23 @@ iframe {
         event.preventDefault();
         next.focus();
     });
+
+    window.addEventListener("resize", scheduleTips);
+    if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(scheduleTips);
+    }
+    if (window.ResizeObserver) {
+        new ResizeObserver(scheduleTips).observe(tabsEl);
+    }
+    // 新建、关闭、重命名标签都会改变标签区宽度，重算空白区。
+    new MutationObserver(scheduleTips).observe(tabsEl, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+    });
+
+    showTip();
+    setInterval(showTip, TIP_INTERVAL);
 
     createTab();
 })();
