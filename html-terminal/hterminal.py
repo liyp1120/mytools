@@ -87,6 +87,7 @@ body {
     box-shadow: inset 0 2px 0 var(--accent);
 }
 .tab:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
+.tab.dragging { opacity: .45; }
 .tab .close {
     display: inline-flex;
     align-items: center;
@@ -161,9 +162,39 @@ iframe {
     const panesEl = document.getElementById("panes");
     const addBtn = document.getElementById("newTab");
     let counter = 0;
+    let dragTab = null;
+    let scrollDir = 0;
+    let scrollRaf = 0;
 
     function tabs() {
         return Array.from(tabsEl.querySelectorAll(".tab"));
+    }
+
+    function updateAutoScroll(clientX) {
+        if (!dragTab) return;
+        const rect = tabsEl.getBoundingClientRect();
+        if (clientX < rect.left + 36) scrollDir = -1;
+        else if (clientX > rect.right - 36) scrollDir = 1;
+        else scrollDir = 0;
+    }
+
+    function tickAutoScroll() {
+        if (!dragTab) {
+            scrollRaf = 0;
+            return;
+        }
+        if (scrollDir) tabsEl.scrollLeft += scrollDir * 10;
+        scrollRaf = requestAnimationFrame(tickAutoScroll);
+    }
+
+    function endDrag() {
+        if (dragTab) dragTab.classList.remove("dragging");
+        dragTab = null;
+        scrollDir = 0;
+        if (scrollRaf) {
+            cancelAnimationFrame(scrollRaf);
+            scrollRaf = 0;
+        }
     }
 
     function sync() {
@@ -281,7 +312,7 @@ iframe {
         const label = document.createElement("span");
         label.className = "label";
         label.textContent = name;
-        label.title = "双击重命名";
+        label.title = "双击重命名，拖动调整顺序";
         const close = document.createElement("button");
         close.className = "close";
         close.type = "button";
@@ -319,6 +350,21 @@ iframe {
             if (event.target.closest(".close")) return;
             startRename(tab);
         });
+        tab.draggable = true;
+        tab.addEventListener("dragstart", (event) => {
+            if (event.target.closest(".rename")) {
+                event.preventDefault();
+                return;
+            }
+            dragTab = tab;
+            // 用自定义类型，避免拖到终端里时被当成文本粘贴
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("application/x-terminal-tab", tab.id);
+            tab.classList.add("dragging");
+            scrollDir = 0;
+            if (!scrollRaf) scrollRaf = requestAnimationFrame(tickAutoScroll);
+        });
+        tab.addEventListener("dragend", endDrag);
         tab.addEventListener("keydown", (event) => {
             if (event.key === "Enter" || event.key === " ") {
                 event.preventDefault();
@@ -333,6 +379,30 @@ iframe {
     }
 
     addBtn.addEventListener("click", createTab);
+
+    tabsEl.addEventListener("dragover", (event) => {
+        if (!dragTab) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        updateAutoScroll(event.clientX);
+        const target = event.target.closest(".tab");
+        if (!target || target === dragTab) return;
+        const rect = target.getBoundingClientRect();
+        const after = event.clientX >= rect.left + rect.width / 2;
+        if (after) {
+            if (target.nextElementSibling !== dragTab) {
+                tabsEl.insertBefore(dragTab, target.nextElementSibling);
+            }
+        } else if (target.previousElementSibling !== dragTab) {
+            tabsEl.insertBefore(dragTab, target);
+        }
+    });
+
+    tabsEl.addEventListener("drop", (event) => {
+        if (!dragTab) return;
+        event.preventDefault();
+        endDrag();
+    });
 
     tabsEl.addEventListener("keydown", (event) => {
         if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
